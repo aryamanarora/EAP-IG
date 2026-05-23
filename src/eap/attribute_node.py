@@ -92,7 +92,7 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
         fwd_index = graph.forward_index(node)
         fwd_hooks_corrupted.append((node.out_hook, partial(activation_hook, fwd_index)))
         fwd_hooks_clean.append((node.out_hook, partial(activation_hook, fwd_index, add=False)))
-        bwd_hooks.append((node.in_hook, partial(gradient_hook, fwd_index, fwd_index)))
+        bwd_hooks.append((node.out_hook, partial(gradient_hook, fwd_index, fwd_index)))
 
     return (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference
 
