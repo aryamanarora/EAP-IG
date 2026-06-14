@@ -695,7 +695,7 @@ class Graph:
         node_dict = {}
         for node_name, node in self.nodes.items():
             node_dict[node_name] = {'in_graph': bool(node.in_graph)}
-            if self.nodes_scores is not None:
+            if self.nodes_scores is not None and node_name != 'logits':
                 node_dict[node_name]['score'] = float(node.score)
             if self.neurons_in_graph is not None:
                 node_dict[node_name]['neurons'] = self.neurons_in_graph[self.forward_index(node)].tolist()
