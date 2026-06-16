@@ -699,9 +699,11 @@ class Graph:
         node_dict = {}
         for node_name, node in self.nodes.items():
             node_dict[node_name] = {'in_graph': bool(node.in_graph)}
-            if self.nodes_scores is not None:
+            # 'logits' is a destination-only node: it has no forward (source) index, so its
+            # score/neurons would index nodes_scores out of bounds. from_json skips it anyway.
+            if self.nodes_scores is not None and node_name != 'logits':
                 node_dict[node_name]['score'] = float(node.score)
-            if self.neurons_in_graph is not None:
+            if self.neurons_in_graph is not None and node_name != 'logits':
                 node_dict[node_name]['neurons'] = self.neurons_in_graph[self.forward_index(node)].tolist()
                 node_dict[node_name]['neurons_scores'] = self.neurons_scores[self.forward_index(node)].tolist()
         d['nodes'] = node_dict 

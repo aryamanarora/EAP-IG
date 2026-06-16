@@ -254,6 +254,191 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
     return scores
 
+def get_scores_eap_ig_local(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
+                            steps=30, quiet:bool=False, neuron:bool=False):
+    """Node-level EAP-IG (inputs) using the LOCAL activation increment inside the IG sum.
+
+    Standard EAP-IG-inputs scores a node by (a^corrupted - a^clean) . (1/m) sum_k grad(alpha_k),
+    pulling the endpoint activation difference out of the integral. That is exact only if the
+    node's activation is linear in alpha; but only the INPUT embeddings are interpolated linearly,
+    so intermediate activations follow a nonlinear path. This variant instead accumulates the
+    realized per-step increment  sum_k grad(alpha_k) . (a(alpha_{k-1}) - a(alpha_k)), i.e. the
+    proper Riemann sum along the actual activation trajectory. Gradients are sampled on the same
+    grid as node EAP-IG-inputs (alpha = k/steps, k=1..steps), so with steps=1 it is identical.
+    """
+    if neuron:
+        scores = torch.zeros((graph.n_forward, graph.cfg.d_model), device='cuda', dtype=model.cfg.dtype)
+    else:
+        scores = torch.zeros((graph.n_forward), device='cuda', dtype=model.cfg.dtype)
+
+    total_items = 0
+    dataloader = dataloader if quiet else tqdm(dataloader)
+    for clean, corrupted, label in dataloader:
+        batch_size = len(clean)
+        total_items += batch_size
+        clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
+        corrupted_tokens, _, _, _ = tokenize_plus(model, corrupted)
+
+        # activation_difference is what the bwd hooks dot against grads; we overwrite it each
+        # step (via the capture hooks below) with the LOCAL increment (prev - cur) per node.
+        (_, _, bwd_hooks), activation_difference = make_hooks_and_matrices(model, graph, batch_size, n_pos, scores, neuron=neuron)
+        (fwd_hooks_add, _, _), acts_corrupted = make_hooks_and_matrices(model, graph, batch_size, n_pos, None, neuron=neuron)
+        (_, fwd_hooks_sub, _), neg_acts_clean = make_hooks_and_matrices(model, graph, batch_size, n_pos, None, neuron=neuron)
+        with torch.inference_mode():
+            with model.hooks(fwd_hooks=fwd_hooks_add):
+                _ = model(corrupted_tokens, attention_mask=attention_mask)        # acts_corrupted = +corrupted
+            with model.hooks(fwd_hooks=fwd_hooks_sub):
+                clean_logits = model(clean_tokens, attention_mask=attention_mask)  # neg_acts_clean = -clean
+        acts_clean = -neg_acts_clean
+
+        input_idx = graph.forward_index(graph.nodes['input'])
+        input_corrupted = acts_corrupted[:, :, input_idx].clone()
+        input_clean = acts_clean[:, :, input_idx].clone()
+
+        prev_acts = acts_corrupted.clone()   # a(alpha_0) = corrupted
+        cur_acts = acts_corrupted.clone()
+
+        def input_interpolation_hook(k: int):
+            def hook_fn(activations, hook):
+                alpha = k / steps
+                new_input = input_corrupted + alpha * (input_clean - input_corrupted) + activations * 0
+                cur_acts[:, :, input_idx] = new_input.detach()
+                activation_difference[:, :, input_idx] = prev_acts[:, :, input_idx] - new_input.detach()
+                return new_input
+            return hook_fn
+
+        def capture_hook(index, activations, hook):
+            acts = activations.detach()
+            cur_acts[:, :, index] = acts
+            activation_difference[:, :, index] = prev_acts[:, :, index] - acts
+
+        capture_fwd_hooks = []
+        for layer in range(graph.cfg['n_layers']):
+            for node in (graph.nodes[f'a{layer}.h0'], graph.nodes[f'm{layer}']):
+                capture_fwd_hooks.append((node.out_hook, partial(capture_hook, graph.forward_index(node))))
+
+        for step in range(1, steps + 1):
+            fwd_hooks = [(graph.nodes['input'].out_hook, input_interpolation_hook(step))] + capture_fwd_hooks
+            with model.hooks(fwd_hooks=fwd_hooks, bwd_hooks=bwd_hooks):
+                logits = model(clean_tokens, attention_mask=attention_mask)
+                metric_value = metric(logits, clean_logits, input_lengths, label)
+                metric_value.backward()
+            prev_acts = cur_acts.clone()
+
+    # No /steps: the per-step increment already carries the 1/steps factor.
+    scores /= total_items
+    return scores
+
+
+class ShapleyElementwiseMult(torch.autograd.Function):
+    """Elementwise multiply with the RelP/Shapley half-rule: each branch gets 0.5 of the
+    incoming gradient (so the product's relevance is split evenly instead of double-counted)."""
+    @staticmethod
+    def forward(ctx, x, y):
+        ctx.save_for_backward(x, y)
+        return x * y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, y = ctx.saved_tensors
+        return 0.5 * grad_output * y, 0.5 * grad_output * x
+
+
+def _relp_act_coeff(act_fn, pre):
+    """Secant linearization of a (gated) activation: coeff = act(pre)/pre, detached.
+    For SiLU this equals sigmoid(pre) exactly (silu(z)=z*sigmoid(z)), matching the
+    Transluce RelP gate rule; gate_act = pre*coeff preserves the forward value while
+    letting the gradient flow through `pre` with the nonlinearity treated as constant."""
+    a = act_fn(pre)
+    safe = torch.where(pre.abs() < 1e-6, torch.ones_like(pre), pre)
+    return (a / safe).detach()
+
+
+def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, use_qk=True):
+    """Forward hooks implementing RelP's three backward modifications (forward values
+    unchanged; only the gradient is altered):
+      (1) every norm scale is detached -> normalization treated as a constant scaling;
+      (2) the gated-MLP gate activation is secant-linearized and the gate x up product
+          uses the half-rule (non-gated MLPs just get the linearized activation);
+      (3) the attention pattern is detached -> gradient flows only through OV (V path).
+    """
+    import os
+    # explicit args set the default; env vars override (for ablation sweeps)
+    use_norm = os.environ.get('RELP_NORM', '1' if use_norm else '0') == '1'
+    use_mlp = os.environ.get('RELP_MLP', '1' if use_mlp else '0') == '1'
+    use_qk = os.environ.get('RELP_QK', '1' if use_qk else '0') == '1'
+    hooks = []
+    for name in list(model.hook_dict.keys()):
+        if (use_norm and name.endswith('.hook_scale')) or (use_qk and name.endswith('.hook_pattern')):
+            hooks.append((name, lambda t, hook: t.detach()))
+    if not use_mlp:
+        return hooks
+
+    def make_store(holder, key):
+        def fn(t, hook):
+            holder[key] = t
+            return t
+        return fn
+
+    def make_relp_post(holder, act_fn, b_in, gated):
+        def fn(post, hook):
+            pre = holder['pre']
+            gate_act = pre * _relp_act_coeff(act_fn, pre)
+            if gated:
+                out = ShapleyElementwiseMult.apply(gate_act, holder['pre_linear'])
+                if b_in is not None:
+                    out = out + b_in
+                return out
+            return gate_act
+        return fn
+
+    for l in range(model.cfg.n_layers):
+        mlp = model.blocks[l].mlp
+        gated = hasattr(mlp, 'W_gate')
+        b_in = getattr(mlp, 'b_in', None)
+        holder = {}
+        hooks.append((f'blocks.{l}.mlp.hook_pre', make_store(holder, 'pre')))
+        if gated:
+            hooks.append((f'blocks.{l}.mlp.hook_pre_linear', make_store(holder, 'pre_linear')))
+        hooks.append((f'blocks.{l}.mlp.hook_post', make_relp_post(holder, mlp.act_fn, b_in, gated)))
+    return hooks
+
+
+def get_scores_relp(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
+                    quiet: bool = False, neuron: bool = False, relp_hooks: bool = True, detach_qk: bool = True):
+    """RelP node attribution: (a^corrupted - a^clean) . grad, a single-point (input x grad)
+    attribution where the backward pass uses RelP's relevance rules (see build_relp_fwd_hooks).
+    With relp_hooks=False this is exactly input x grad (EAP / 1-step IG) -- used as a self-test."""
+    if neuron:
+        scores = torch.zeros((graph.n_forward, graph.cfg.d_model), device='cuda', dtype=model.cfg.dtype)
+    else:
+        scores = torch.zeros((graph.n_forward), device='cuda', dtype=model.cfg.dtype)
+
+    total_items = 0
+    dataloader = dataloader if quiet else tqdm(dataloader)
+    for clean, corrupted, label in dataloader:
+        batch_size = len(clean)
+        total_items += batch_size
+        clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
+        corrupted_tokens, _, _, _ = tokenize_plus(model, corrupted)
+
+        (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference = make_hooks_and_matrices(model, graph, batch_size, n_pos, scores, neuron=neuron)
+
+        with torch.inference_mode():
+            with model.hooks(fwd_hooks=fwd_hooks_corrupted):
+                _ = model(corrupted_tokens, attention_mask=attention_mask)   # activation_difference = +corrupted
+            clean_logits = model(clean_tokens, attention_mask=attention_mask)
+
+        extra = build_relp_fwd_hooks(model, use_qk=detach_qk) if relp_hooks else []
+        with model.hooks(fwd_hooks=fwd_hooks_clean + extra, bwd_hooks=bwd_hooks):
+            logits = model(clean_tokens, attention_mask=attention_mask)       # activation_difference -> corrupted - clean
+            metric_value = metric(logits, clean_logits, input_lengths, label)
+            metric_value.backward()
+
+    scores /= total_items
+    return scores
+
+
 def get_scores_ig_activations(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor], 
                               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', steps=30, 
                               intervention_dataloader: Optional[DataLoader]=None, quiet:bool=False, neuron:bool=False):
@@ -411,6 +596,16 @@ def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoade
         if intervention != 'patching':
             raise ValueError(f"intervention must be 'patching' for EAP-IG-inputs, but got {intervention}")
         scores = get_scores_eap_ig(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet, neuron=neuron)
+    elif method == 'EAP-IG-inputs-local':
+        if intervention != 'patching':
+            raise ValueError(f"intervention must be 'patching' for EAP-IG-inputs-local, but got {intervention}")
+        scores = get_scores_eap_ig_local(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet, neuron=neuron)
+    elif method == 'RelP':
+        scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron)
+    elif method == 'RelP-qkgrad':
+        scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False)
+    elif method == 'RelP-norules':
+        scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, relp_hooks=False)
     elif method == 'EAP-IG-activations':
         scores = get_scores_ig_activations(model, graph, dataloader, metric, steps=ig_steps, 
                                            intervention=intervention, intervention_dataloader=intervention_dataloader, 
