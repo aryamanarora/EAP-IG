@@ -371,9 +371,16 @@ class ShapleySoftmax(torch.autograd.Function):
     def backward(ctx, grad_output):
         logits, result = ctx.saved_tensors
         with torch.no_grad():
-            R_l = grad_output.to(torch.float32) * result
+            # upcast to fp32 and guard the divide-by-logits: it blows up to NaN/inf on
+            # bf16 / large models (near-zero or extreme attn scores, gemma2 softcapping).
+            logits32 = logits.to(torch.float32)
+            result32 = result.to(torch.float32)
+            R_l = grad_output.to(torch.float32) * result32
             total_R = R_l.sum(-1, keepdim=True)
-            grad_x = (total_R * result) / logits
+            safe = logits32.abs() > 1e-6
+            grad_x = torch.where(safe, (total_R * result32) / torch.where(safe, logits32, torch.ones_like(logits32)),
+                                 torch.zeros_like(logits32))
+            grad_x = torch.nan_to_num(grad_x, nan=0.0, posinf=0.0, neginf=0.0)
         return grad_x.to(logits.dtype)
 
 
