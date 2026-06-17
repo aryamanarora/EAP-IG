@@ -14,7 +14,8 @@ from .graph import Graph, AttentionNode
 def evaluate_graph(model: HookedTransformer, graph: Graph, dataloader: DataLoader, 
                    metrics: Union[Callable[[Tensor],Tensor], List[Callable[[Tensor], Tensor]]], 
                    quiet=False, intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', 
-                   intervention_dataloader: Optional[DataLoader]=None, skip_clean:bool=True) -> Union[torch.Tensor, List[torch.Tensor]]:
+                   intervention_dataloader: Optional[DataLoader]=None, skip_clean:bool=True,
+                   optimal_ablation_path: Optional[str]=None) -> Union[torch.Tensor, List[torch.Tensor]]:
     """Evaluate a circuit (i.e. a graph where only some nodes are false, probably created by calling graph.apply_threshold). You probably want to prune 
         beforehand to make sure your circuit is valid.
 

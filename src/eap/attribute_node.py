@@ -344,6 +344,39 @@ class ShapleyElementwiseMult(torch.autograd.Function):
         return 0.5 * grad_output * y, 0.5 * grad_output * x
 
 
+class HalfGrad(torch.autograd.Function):
+    """Identity forward, 0.5x gradient backward. Applied to a bilinear matmul's OUTPUT this
+    is equivalent to Transluce's ShapleyMatmul half-rule on its inputs: for z = x @ y, scaling
+    grad_z by 0.5 yields grad_x, grad_y each halved. Used for the AttnRLP QK and OV matmuls."""
+    @staticmethod
+    def forward(ctx, x):
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return 0.5 * grad_output
+
+
+class ShapleySoftmax(torch.autograd.Function):
+    """LRP/Shapley-style softmax backward (Transluce AttnRLP). Forward = softmax; backward
+    redistributes relevance proportional to the softmax output and divides by the pre-softmax
+    scores: grad_x = (sum_j grad_j * p_j) * p_i / scores_i."""
+    @staticmethod
+    def forward(ctx, x):
+        result = torch.nn.functional.softmax(x, dim=-1, dtype=torch.float32)
+        ctx.save_for_backward(x, result)
+        return result.to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, result = ctx.saved_tensors
+        with torch.no_grad():
+            R_l = grad_output.to(torch.float32) * result
+            total_R = R_l.sum(-1, keepdim=True)
+            grad_x = (total_R * result) / logits
+        return grad_x.to(logits.dtype)
+
+
 def _relp_act_coeff(act_fn, pre):
     """Secant linearization of a (gated) activation: coeff = act(pre)/pre, detached.
     For SiLU this equals sigmoid(pre) exactly (silu(z)=z*sigmoid(z)), matching the
@@ -354,7 +387,7 @@ def _relp_act_coeff(act_fn, pre):
     return (a / safe).detach()
 
 
-def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, use_qk=True):
+def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, use_qk=True, shapley_attn=False):
     """Forward hooks implementing RelP's three backward modifications (forward values
     unchanged; only the gradient is altered):
       (1) every norm scale is detached -> normalization treated as a constant scaling;
@@ -371,6 +404,27 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
     for name in list(model.hook_dict.keys()):
         if (use_norm and name.endswith('.hook_scale')) or (use_qk and name.endswith('.hook_pattern')):
             hooks.append((name, lambda t, hook: t.detach()))
+
+    # AttnRLP attention rules: half-rule on the QK and OV matmuls (HalfGrad on their outputs)
+    # plus the LRP softmax backward (ShapleySoftmax). hook_attn_scores fires pre-softmax, so we
+    # capture the (scaled+masked) scores there and rebuild the pattern with ShapleySoftmax.
+    if shapley_attn:
+        def make_attn_hooks(holder):
+            def cap_scores(t, hook):
+                s = HalfGrad.apply(t)        # QK matmul half-rule (grad x0.5 to Q and K)
+                holder['scores'] = s
+                return s
+            def shapley_pattern(t, hook):
+                return ShapleySoftmax.apply(holder['scores'])   # LRP softmax backward
+            def half_z(t, hook):
+                return HalfGrad.apply(t)     # OV matmul half-rule (grad x0.5 to pattern and V)
+            return cap_scores, shapley_pattern, half_z
+        for l in range(model.cfg.n_layers):
+            cap, pat, hz = make_attn_hooks({})
+            hooks.append((f'blocks.{l}.attn.hook_attn_scores', cap))
+            hooks.append((f'blocks.{l}.attn.hook_pattern', pat))
+            hooks.append((f'blocks.{l}.attn.hook_z', hz))
+
     if not use_mlp:
         return hooks
 
@@ -405,7 +459,8 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
 
 
 def get_scores_relp(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
-                    quiet: bool = False, neuron: bool = False, relp_hooks: bool = True, detach_qk: bool = True):
+                    quiet: bool = False, neuron: bool = False, relp_hooks: bool = True, detach_qk: bool = True,
+                    shapley_attn: bool = False):
     """RelP node attribution: (a^corrupted - a^clean) . grad, a single-point (input x grad)
     attribution where the backward pass uses RelP's relevance rules (see build_relp_fwd_hooks).
     With relp_hooks=False this is exactly input x grad (EAP / 1-step IG) -- used as a self-test."""
@@ -429,7 +484,7 @@ def get_scores_relp(model: HookedTransformer, graph: Graph, dataloader: DataLoad
                 _ = model(corrupted_tokens, attention_mask=attention_mask)   # activation_difference = +corrupted
             clean_logits = model(clean_tokens, attention_mask=attention_mask)
 
-        extra = build_relp_fwd_hooks(model, use_qk=detach_qk) if relp_hooks else []
+        extra = build_relp_fwd_hooks(model, use_qk=detach_qk, shapley_attn=shapley_attn) if relp_hooks else []
         with model.hooks(fwd_hooks=fwd_hooks_clean + extra, bwd_hooks=bwd_hooks):
             logits = model(clean_tokens, attention_mask=attention_mask)       # activation_difference -> corrupted - clean
             metric_value = metric(logits, clean_logits, input_lengths, label)
@@ -576,8 +631,10 @@ allowed_aggregations = {'sum', 'mean'}
 def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor], 
                    method: Literal['EAP', 'EAP-IG-inputs', 'EAP-IG-activations', 'exact'], 
                    intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', 
-                   aggregation='sum', ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, 
-                   quiet:bool=False, neuron:bool=False):
+                   aggregation='sum', ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None,
+                   quiet:bool=False, neuron:bool=False, optimal_ablation_path: Optional[str]=None):
+    # optimal_ablation_path is accepted for compatibility with MIB's run_attribution.py
+    # (only the edge-level / 'optimal' ablation path uses it; ignored for these node methods).
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
     assert model.cfg.use_split_qkv_input, "Model must be configured to use split qkv inputs (model.cfg.use_split_qkv_input)"
     assert model.cfg.use_hook_mlp_in, "Model must be configured to use hook MLP in (model.cfg.use_hook_mlp_in)"
@@ -604,6 +661,8 @@ def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoade
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron)
     elif method == 'RelP-qkgrad':
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False)
+    elif method == 'AttnRLP':
+        scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False, shapley_attn=True)
     elif method == 'RelP-norules':
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, relp_hooks=False)
     elif method == 'EAP-IG-activations':
