@@ -377,6 +377,38 @@ class ShapleySoftmax(torch.autograd.Function):
         return grad_x.to(logits.dtype)
 
 
+class ScaleGrad(torch.autograd.Function):
+    """Identity forward, gradient scaled by a constant on backward (GIM Q/K/V grad scaling)."""
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = float(scale)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output * ctx.scale, None
+
+
+class TempSoftmax(torch.autograd.Function):
+    """GIM softmax: forward = softmax(x) (T=1), backward = softmax(x/T) Jacobian-vector product
+    (a 'softer' gradient). Default T=2."""
+    @staticmethod
+    def forward(ctx, x, T):
+        ctx.T = float(T)
+        ctx.save_for_backward(x)
+        return torch.nn.functional.softmax(x, dim=-1, dtype=torch.float32).to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x,) = ctx.saved_tensors
+        with torch.no_grad():
+            sT = torch.nn.functional.softmax(x / ctx.T, dim=-1, dtype=torch.float32)
+            g = grad_output.to(torch.float32)
+            dot = (g * sT).sum(-1, keepdim=True)
+            grad_x = sT * (g - dot)
+        return grad_x.to(x.dtype), None
+
+
 def _relp_act_coeff(act_fn, pre):
     """Secant linearization of a (gated) activation: coeff = act(pre)/pre, detached.
     For SiLU this equals sigmoid(pre) exactly (silu(z)=z*sigmoid(z)), matching the
@@ -387,7 +419,8 @@ def _relp_act_coeff(act_fn, pre):
     return (a / safe).detach()
 
 
-def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, use_qk=True, shapley_attn=False):
+def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, use_qk=True, shapley_attn=False,
+                         gim_attn=False, gim_T=2.0, gim_qk_scale=0.25, gim_v_scale=0.5):
     """Forward hooks implementing RelP's three backward modifications (forward values
     unchanged; only the gradient is altered):
       (1) every norm scale is detached -> normalization treated as a constant scaling;
@@ -425,6 +458,24 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
             hooks.append((f'blocks.{l}.attn.hook_pattern', pat))
             hooks.append((f'blocks.{l}.attn.hook_z', hz))
 
+    # GIM attention rules: scale Q/K/V gradients by constants (straight-through) and use a
+    # temperature-softmax backward. No MLP rule (GIM leaves the MLP gradient unmodified).
+    if gim_attn:
+        def make_gim(holder):
+            def cap(t, hook):
+                holder['scores'] = t
+                return t
+            def pat(t, hook):
+                return TempSoftmax.apply(holder['scores'], gim_T)
+            return cap, pat
+        for l in range(model.cfg.n_layers):
+            cap, pat = make_gim({})
+            hooks.append((f'blocks.{l}.attn.hook_q', lambda t, hook: ScaleGrad.apply(t, gim_qk_scale)))
+            hooks.append((f'blocks.{l}.attn.hook_k', lambda t, hook: ScaleGrad.apply(t, gim_qk_scale)))
+            hooks.append((f'blocks.{l}.attn.hook_v', lambda t, hook: ScaleGrad.apply(t, gim_v_scale)))
+            hooks.append((f'blocks.{l}.attn.hook_attn_scores', cap))
+            hooks.append((f'blocks.{l}.attn.hook_pattern', pat))
+
     if not use_mlp:
         return hooks
 
@@ -460,7 +511,7 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
 
 def get_scores_relp(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
                     quiet: bool = False, neuron: bool = False, relp_hooks: bool = True, detach_qk: bool = True,
-                    shapley_attn: bool = False):
+                    shapley_attn: bool = False, use_mlp: bool = True, gim_attn: bool = False):
     """RelP node attribution: (a^corrupted - a^clean) . grad, a single-point (input x grad)
     attribution where the backward pass uses RelP's relevance rules (see build_relp_fwd_hooks).
     With relp_hooks=False this is exactly input x grad (EAP / 1-step IG) -- used as a self-test."""
@@ -484,7 +535,7 @@ def get_scores_relp(model: HookedTransformer, graph: Graph, dataloader: DataLoad
                 _ = model(corrupted_tokens, attention_mask=attention_mask)   # activation_difference = +corrupted
             clean_logits = model(clean_tokens, attention_mask=attention_mask)
 
-        extra = build_relp_fwd_hooks(model, use_qk=detach_qk, shapley_attn=shapley_attn) if relp_hooks else []
+        extra = build_relp_fwd_hooks(model, use_mlp=use_mlp, use_qk=detach_qk, shapley_attn=shapley_attn, gim_attn=gim_attn) if relp_hooks else []
         with model.hooks(fwd_hooks=fwd_hooks_clean + extra, bwd_hooks=bwd_hooks):
             logits = model(clean_tokens, attention_mask=attention_mask)       # activation_difference -> corrupted - clean
             metric_value = metric(logits, clean_logits, input_lengths, label)
@@ -663,6 +714,8 @@ def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoade
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False)
     elif method == 'AttnRLP':
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False, shapley_attn=True)
+    elif method == 'GIM':
+        scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False, use_mlp=False, gim_attn=True)
     elif method == 'RelP-norules':
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, relp_hooks=False)
     elif method == 'EAP-IG-activations':
