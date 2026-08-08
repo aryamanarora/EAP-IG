@@ -346,8 +346,10 @@ class ShapleyElementwiseMult(torch.autograd.Function):
 
 class HalfGrad(torch.autograd.Function):
     """Identity forward, 0.5x gradient backward. Applied to a bilinear matmul's OUTPUT this
-    is equivalent to Transluce's ShapleyMatmul half-rule on its inputs: for z = x @ y, scaling
-    grad_z by 0.5 yields grad_x, grad_y each halved. Used for the AttnRLP QK and OV matmuls."""
+    is equivalent to the uniform (half) rule on its inputs: for z = x @ y, scaling grad_z by 0.5
+    yields grad_x, grad_y each halved. This matches AttnLRP's uniform rule for bilinear matmuls
+    (Achtibat et al. 2024, Eq. 14-15) and LXT's divide_gradient(q,4)/(k,4)/(v,2). Used for the
+    RelPShapley QK and OV matmuls."""
     @staticmethod
     def forward(ctx, x):
         return x
@@ -358,7 +360,9 @@ class HalfGrad(torch.autograd.Function):
 
 
 class ShapleySoftmax(torch.autograd.Function):
-    """LRP/Shapley-style softmax backward (Transluce AttnRLP). Forward = softmax; backward
+    """Shapley-style softmax backward. OURS -- this rule is not from AttnLRP or RelP: LXT
+    patches nothing at the softmax, and RelP's rule set is LN/Identity/Half/AH only.
+    Forward = softmax; backward
     redistributes relevance proportional to the softmax output and divides by the pre-softmax
     scores: grad_x = (sum_j grad_j * p_j) * p_i / scores_i."""
     @staticmethod
@@ -418,8 +422,9 @@ class TempSoftmax(torch.autograd.Function):
 
 def _relp_act_coeff(act_fn, pre):
     """Secant linearization of a (gated) activation: coeff = act(pre)/pre, detached.
-    For SiLU this equals sigmoid(pre) exactly (silu(z)=z*sigmoid(z)), matching the
-    Transluce RelP gate rule; gate_act = pre*coeff preserves the forward value while
+    For SiLU this equals sigmoid(pre) exactly (silu(z)=z*sigmoid(z)), matching RelP's
+    Identity-rule (ModifiedAct transform='identity') and AttnLRP's identity rule for
+    element-wise nonlinearities; gate_act = pre*coeff preserves the forward value while
     letting the gradient flow through `pre` with the nonlinearity treated as constant."""
     a = act_fn(pre)
     safe = torch.where(pre.abs() < 1e-6, torch.ones_like(pre), pre)
@@ -445,7 +450,7 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
         if (use_norm and name.endswith('.hook_scale')) or (use_qk and name.endswith('.hook_pattern')):
             hooks.append((name, lambda t, hook: t.detach()))
 
-    # AttnRLP attention rules: half-rule on the QK and OV matmuls (HalfGrad on their outputs)
+    # RelPShapley attention rules: half-rule on the QK and OV matmuls (HalfGrad on their outputs)
     # plus the LRP softmax backward (ShapleySoftmax). hook_attn_scores fires pre-softmax, so we
     # capture the (scaled+masked) scores there and rebuild the pattern with ShapleySoftmax.
     if shapley_attn:
@@ -719,7 +724,7 @@ def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoade
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron)
     elif method == 'RelP-qkgrad':
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False)
-    elif method == 'AttnRLP':
+    elif method == 'RelPShapley':
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False, shapley_attn=True)
     elif method == 'GIM':
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False, use_mlp=False, gim_attn=True)
