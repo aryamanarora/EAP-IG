@@ -432,7 +432,8 @@ def _relp_act_coeff(act_fn, pre):
 
 
 def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, use_qk=True, shapley_attn=False,
-                         softmax_rule=True, gim_attn=False, gim_T=2.0, gim_qk_scale=0.25, gim_v_scale=0.5):
+                         softmax_rule=True, linearize_act=True, gim_attn=False, gim_T=2.0,
+                         gim_qk_scale=0.25, gim_v_scale=0.5):
     """Forward hooks implementing RelP's three backward modifications (forward values
     unchanged; only the gradient is altered):
       (1) every norm scale is detached -> normalization treated as a constant scaling;
@@ -508,7 +509,9 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
     def make_relp_post(holder, act_fn, b_in, gated):
         def fn(post, hook):
             pre = holder['pre']
-            gate_act = pre * _relp_act_coeff(act_fn, pre)
+            # linearize_act=False keeps the true activation derivative (GIM's
+            # activation_backward='grad'); only the gate product's half-rule is applied.
+            gate_act = pre * _relp_act_coeff(act_fn, pre) if linearize_act else act_fn(pre)
             if gated:
                 out = ShapleyElementwiseMult.apply(gate_act, holder['pre_linear'])
                 if b_in is not None:
@@ -520,6 +523,8 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
     for l in range(model.cfg.n_layers):
         mlp = model.blocks[l].mlp
         gated = hasattr(mlp, 'W_gate')
+        if not linearize_act and not gated:
+            continue      # GIM's scale_mlp_gate fires only for gated MLPs; leave gpt2 untouched
         b_in = getattr(mlp, 'b_in', None)
         holder = {}
         hooks.append((f'blocks.{l}.mlp.hook_pre', make_store(holder, 'pre')))
@@ -532,7 +537,7 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
 def get_scores_relp(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
                     quiet: bool = False, neuron: bool = False, relp_hooks: bool = True, detach_qk: bool = True,
                     shapley_attn: bool = False, softmax_rule: bool = True, use_mlp: bool = True,
-                    gim_attn: bool = False):
+                    linearize_act: bool = True, gim_attn: bool = False):
     """RelP node attribution: (a^corrupted - a^clean) . grad, a single-point (input x grad)
     attribution where the backward pass uses RelP's relevance rules (see build_relp_fwd_hooks).
     With relp_hooks=False this is exactly input x grad (EAP / 1-step IG) -- used as a self-test."""
@@ -557,7 +562,8 @@ def get_scores_relp(model: HookedTransformer, graph: Graph, dataloader: DataLoad
             clean_logits = model(clean_tokens, attention_mask=attention_mask)
 
         extra = build_relp_fwd_hooks(model, use_mlp=use_mlp, use_qk=detach_qk, shapley_attn=shapley_attn,
-                                     softmax_rule=softmax_rule, gim_attn=gim_attn) if relp_hooks else []
+                                     softmax_rule=softmax_rule, linearize_act=linearize_act,
+                                     gim_attn=gim_attn) if relp_hooks else []
         with model.hooks(fwd_hooks=fwd_hooks_clean + extra, bwd_hooks=bwd_hooks):
             logits = model(clean_tokens, attention_mask=attention_mask)       # activation_difference -> corrupted - clean
             metric_value = metric(logits, clean_logits, input_lengths, label)
@@ -743,7 +749,14 @@ def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoade
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron,
                                  detach_qk=False, shapley_attn=True, softmax_rule=False)
     elif method == 'GIM':
-        scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False, use_mlp=False, gim_attn=True)
+        # GIM (Edin et al. 2026) = norm freeze + q/4,k/4,v/2 + tempered (T=2) softmax backward
+        # + scale_mlp_gate. That last rule is `mlp_grad / 2` for GATED MLPs only, which is exactly
+        # ShapleyElementwiseMult on the gate x up product: halving each branch's gradient and
+        # summing them back at the MLP input gives (gate_grad + in_grad)/2 = mlp_grad/2. GIM keeps
+        # the TRUE activation derivative though (activation_backward='grad'), so no secant
+        # linearization -> linearize_act=False.
+        scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False,
+                                 linearize_act=False, gim_attn=True)
     elif method == 'RelP-norules':
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, relp_hooks=False)
     elif method == 'EAP-IG-activations':
