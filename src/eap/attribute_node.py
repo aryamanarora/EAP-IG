@@ -432,7 +432,7 @@ def _relp_act_coeff(act_fn, pre):
 
 
 def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, use_qk=True, shapley_attn=False,
-                         gim_attn=False, gim_T=2.0, gim_qk_scale=0.25, gim_v_scale=0.5):
+                         softmax_rule=True, gim_attn=False, gim_T=2.0, gim_qk_scale=0.25, gim_v_scale=0.5):
     """Forward hooks implementing RelP's three backward modifications (forward values
     unchanged; only the gradient is altered):
       (1) every norm scale is detached -> normalization treated as a constant scaling;
@@ -450,9 +450,16 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
         if (use_norm and name.endswith('.hook_scale')) or (use_qk and name.endswith('.hook_pattern')):
             hooks.append((name, lambda t, hook: t.detach()))
 
-    # RelPShapley attention rules: half-rule on the QK and OV matmuls (HalfGrad on their outputs)
-    # plus the LRP softmax backward (ShapleySoftmax). hook_attn_scores fires pre-softmax, so we
-    # capture the (scaled+masked) scores there and rebuild the pattern with ShapleySoftmax.
+    # Attention half-rules: HalfGrad on the QK and OV matmul OUTPUTS. Composed, this gives the
+    # Q and K gradients a 1/4 factor (1/2 at hook_z -> pattern, then 1/2 again at hook_attn_scores)
+    # and the V gradient 1/2, i.e. exactly AttnLRP's uniform rule for bilinear matmuls
+    # (Achtibat et al. 2024, Eq. 14-15) as implemented in LXT's divide_gradient(q,4)/(k,4)/(v,2).
+    #
+    # softmax_rule=True additionally swaps the softmax backward for ShapleySoftmax. That rule is
+    # OURS -- LXT patches nothing at the softmax and AttnLRP Eq. (13) reduces to the ordinary
+    # softmax Jacobian-vector product -- so faithful AttnLRP is softmax_rule=False.
+    # hook_attn_scores fires pre-softmax, so we capture the (scaled+masked) scores there and
+    # rebuild the pattern from them when the softmax rule is on.
     if shapley_attn:
         def make_attn_hooks(holder):
             def cap_scores(t, hook):
@@ -467,7 +474,8 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
         for l in range(model.cfg.n_layers):
             cap, pat, hz = make_attn_hooks({})
             hooks.append((f'blocks.{l}.attn.hook_attn_scores', cap))
-            hooks.append((f'blocks.{l}.attn.hook_pattern', pat))
+            if softmax_rule:
+                hooks.append((f'blocks.{l}.attn.hook_pattern', pat))
             hooks.append((f'blocks.{l}.attn.hook_z', hz))
 
     # GIM attention rules: scale Q/K/V gradients by constants (straight-through) and use a
@@ -523,7 +531,8 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
 
 def get_scores_relp(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
                     quiet: bool = False, neuron: bool = False, relp_hooks: bool = True, detach_qk: bool = True,
-                    shapley_attn: bool = False, use_mlp: bool = True, gim_attn: bool = False):
+                    shapley_attn: bool = False, softmax_rule: bool = True, use_mlp: bool = True,
+                    gim_attn: bool = False):
     """RelP node attribution: (a^corrupted - a^clean) . grad, a single-point (input x grad)
     attribution where the backward pass uses RelP's relevance rules (see build_relp_fwd_hooks).
     With relp_hooks=False this is exactly input x grad (EAP / 1-step IG) -- used as a self-test."""
@@ -547,7 +556,8 @@ def get_scores_relp(model: HookedTransformer, graph: Graph, dataloader: DataLoad
                 _ = model(corrupted_tokens, attention_mask=attention_mask)   # activation_difference = +corrupted
             clean_logits = model(clean_tokens, attention_mask=attention_mask)
 
-        extra = build_relp_fwd_hooks(model, use_mlp=use_mlp, use_qk=detach_qk, shapley_attn=shapley_attn, gim_attn=gim_attn) if relp_hooks else []
+        extra = build_relp_fwd_hooks(model, use_mlp=use_mlp, use_qk=detach_qk, shapley_attn=shapley_attn,
+                                     softmax_rule=softmax_rule, gim_attn=gim_attn) if relp_hooks else []
         with model.hooks(fwd_hooks=fwd_hooks_clean + extra, bwd_hooks=bwd_hooks):
             logits = model(clean_tokens, attention_mask=attention_mask)       # activation_difference -> corrupted - clean
             metric_value = metric(logits, clean_logits, input_lengths, label)
@@ -726,6 +736,12 @@ def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoade
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False)
     elif method == 'RelPShapley':
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False, shapley_attn=True)
+    elif method == 'AttnLRP':
+        # Faithful AttnLRP: RelP's norm/identity/half rules + the uniform rule on both attention
+        # matmuls, and the ORDINARY softmax gradient (AttnLRP Eq. 13 reduces to it; LXT patches
+        # nothing there). This is RelPShapley minus the invented ShapleySoftmax rule.
+        scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron,
+                                 detach_qk=False, shapley_attn=True, softmax_rule=False)
     elif method == 'GIM':
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False, use_mlp=False, gim_attn=True)
     elif method == 'RelP-norules':
