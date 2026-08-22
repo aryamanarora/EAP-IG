@@ -254,6 +254,96 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
     return scores
 
+
+def get_scores_eap_ig_mc(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
+                         steps=1, quiet:bool=False, neuron:bool=False, seed:int=0):
+    """"Stepless" EAP-IG-inputs: alpha ~ U(0,1) drawn per example instead of a fixed grid.
+
+    EAP-IG-inputs estimates  (a_clean - a_corrupted) . integral_0^1 grad(alpha) d alpha  with a
+    RIGHT-ENDPOINT Riemann sum over alpha = k/m, k = 1..m, at m backward passes per batch. This
+    estimates the SAME integral by Monte Carlo -- draw alpha ~ U(0,1), average -- which is
+    unbiased at every m, including m = 1.
+
+    THAT IS THE POINT OF m=1. get_scores_eap_ig(steps=1) evaluates the grid at its single point
+    alpha = 1, i.e. the gradient at the CLEAN input; it is not an estimate of the integral at all,
+    it is input x grad (run_variants.sh calls that row `ig1` and says so). This function at
+    steps=1 costs exactly the same one forward+backward per batch and IS an unbiased estimate of
+    the m -> infinity limit. So `EAP-IG-inputs-mc --ig-steps 1` vs `EAP-IG-inputs --ig-steps 1` is
+    a compute-matched contrast in which the ONLY difference is where alpha is placed.
+
+    ALPHA IS PER-EXAMPLE, WHICH IS FREE AND IS MOST OF THE ESTIMATOR'S QUALITY. The interpolation
+    hook writes a [batch, pos, d_model] tensor, so a [batch, 1, 1] alpha costs the same forward as
+    a scalar one but yields batch_size independent draws per pass. Since the final score sums over
+    examples before anything else, the MC error of a unit's score then falls like
+    1/sqrt(n_examples), not 1/sqrt(n_batches) -- on gpt2/ioi that is 1000 draws rather than 50.
+    It also means the estimator's variance depends on --batch-size only through arithmetic, not
+    through statistics, so a cell forced to batch-size 1 (llama3) is not penalised.
+
+    THE ESTIMAND IS THE INTEGRAL, NOT THE m-STEP GRID, so this does not converge to
+    get_scores_eap_ig(steps=m) for the same m -- it converges to steps -> infinity. Comparing it
+    against `ref` (m=5) is a comparison of two approximations to the same quantity at 5x different
+    cost, which is the interesting comparison; comparing it against m=1 is compute-matched.
+
+    Seeded (default 0) so a run is reproducible and so replicates can be obtained by varying the
+    seed alone -- the spread across seeds IS this estimator's error bar, and it is the number that
+    decides whether a win over `ig1` is real.
+    """
+    if neuron:
+        scores = torch.zeros((graph.n_forward, graph.cfg.d_model), device='cuda', dtype=model.cfg.dtype)
+    else:
+        scores = torch.zeros((graph.n_forward), device='cuda', dtype=model.cfg.dtype)
+
+    # CPU generator, so the alpha stream depends only on the seed and the batch sizes -- not on
+    # the GPU, the dtype, or anything else that differs between the four models in this sweep.
+    gen = torch.Generator(device='cpu')
+    gen.manual_seed(seed)
+
+    total_items = 0
+    dataloader = dataloader if quiet else tqdm(dataloader)
+    for clean, corrupted, label in dataloader:
+        batch_size = len(clean)
+        total_items += batch_size
+        clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
+        corrupted_tokens, _, _, _ = tokenize_plus(model, corrupted)
+
+        (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference = make_hooks_and_matrices(model, graph, batch_size, n_pos, scores, neuron=neuron)
+
+        with torch.inference_mode():
+            with model.hooks(fwd_hooks=fwd_hooks_corrupted):
+                _ = model(corrupted_tokens, attention_mask=attention_mask)
+
+            input_activations_corrupted = activation_difference[:, :, graph.forward_index(graph.nodes['input'])].clone()
+
+            with model.hooks(fwd_hooks=fwd_hooks_clean):
+                clean_logits = model(clean_tokens, attention_mask=attention_mask)
+
+            input_activations_clean = input_activations_corrupted - activation_difference[:, :, graph.forward_index(graph.nodes['input'])]
+
+        # + activations * 0  will cause a backwards pass on new_input
+        def input_interpolation_hook(alpha: Tensor):
+            def hook_fn(activations, hook):
+                new_input = input_activations_corrupted + alpha * (input_activations_clean - input_activations_corrupted) + activations * 0
+                return new_input
+            return hook_fn
+
+        total_steps = 0
+        for step in range(steps):
+            total_steps += 1
+            alpha = torch.rand(batch_size, 1, 1, generator=gen).to(input_activations_corrupted)
+            with model.hooks(fwd_hooks=[(graph.nodes['input'].out_hook, input_interpolation_hook(alpha))], bwd_hooks=bwd_hooks):
+                logits = model(clean_tokens, attention_mask=attention_mask)
+                metric_value = metric(logits, clean_logits, input_lengths, label)
+                metric_value.backward()
+
+    # Same normalisation as get_scores_eap_ig (total_steps is reset per batch, so it ends at
+    # `steps`), which keeps the mc scores on the same scale as the grid ones. Only the ranking is
+    # used downstream, but a shared scale makes score-level scatter plots meaningful.
+    scores /= total_items
+    scores /= total_steps
+
+    return scores
+
+
 def get_scores_eap_ig_local(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
                             steps=30, quiet:bool=False, neuron:bool=False):
     """Node-level EAP-IG (inputs) using the LOCAL activation increment inside the IG sum.
@@ -711,7 +801,8 @@ def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoade
                    method: Literal['EAP', 'EAP-IG-inputs', 'EAP-IG-activations', 'exact'], 
                    intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', 
                    aggregation='sum', ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None,
-                   quiet:bool=False, neuron:bool=False, optimal_ablation_path: Optional[str]=None):
+                   quiet:bool=False, neuron:bool=False, optimal_ablation_path: Optional[str]=None,
+                   mc_seed: int=0):
     # optimal_ablation_path is accepted for compatibility with MIB's run_attribution.py
     # (only the edge-level / 'optimal' ablation path uses it; ignored for these node methods).
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
@@ -732,6 +823,11 @@ def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoade
         if intervention != 'patching':
             raise ValueError(f"intervention must be 'patching' for EAP-IG-inputs, but got {intervention}")
         scores = get_scores_eap_ig(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet, neuron=neuron)
+    elif method == 'EAP-IG-inputs-mc':
+        if intervention != 'patching':
+            raise ValueError(f"intervention must be 'patching' for EAP-IG-inputs-mc, but got {intervention}")
+        scores = get_scores_eap_ig_mc(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet,
+                                      neuron=neuron, seed=mc_seed)
     elif method == 'EAP-IG-inputs-local':
         if intervention != 'patching':
             raise ValueError(f"intervention must be 'patching' for EAP-IG-inputs-local, but got {intervention}")
