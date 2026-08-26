@@ -182,7 +182,93 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
     return scores
 
-def get_scores_ig_activations(model: HookedTransformer, graph: Graph, dataloader: DataLoader, 
+def get_scores_eap_ig_mc(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
+                         steps=1, quiet=False, seed:int=0):
+    """"Stepless" EAP-IG-inputs at EDGE level: alpha ~ U(0,1) per example, not a fixed grid.
+
+    The edge twin of attribute_node.get_scores_eap_ig_mc, and the argument is the same one:
+    EAP-IG-inputs estimates (a_clean - a_corrupted) . integral_0^1 grad(alpha) d alpha with a
+    Riemann sum at m backward passes per batch, while this estimates the SAME integral by Monte
+    Carlo, which is unbiased at every m including m = 1. Alpha is drawn PER EXAMPLE ([batch,1,1],
+    broadcasting over n_pos and d_model), so a batch yields batch_size independent draws for the
+    price of one forward and the MC error of a score falls like 1/sqrt(n_examples) rather than
+    1/sqrt(n_batches) -- which is why the batch-size-1 llama3 cells are not penalised.
+
+    ONE THING DIFFERS FROM THE NODE VERSION, and it changes what the compute-matched control is.
+    get_scores_eap_ig above runs `for step in range(0, steps)` at alpha = step/steps, i.e. a
+    LEFT-endpoint grid alpha = 0, 1/m, ..., (m-1)/m; the node file's grid is the RIGHT-endpoint
+    one, alpha = 1/m, ..., 1. So at m=1 the node grid degenerates to alpha=1 (the gradient at the
+    CLEAN input, i.e. input x gradient) while this one degenerates to alpha=0 (the gradient at the
+    CORRUPTED input). Both are one forward+backward and neither is an estimate of the integral, so
+    either is a fair compute-matched control -- but they are DIFFERENT controls, and an edge-level
+    "mc vs m=1" number is not the node-level contrast with a different substrate. Say which
+    endpoint when reporting it. (The left-endpoint grid is upstream's, unmodified; it is not a bug
+    to fix here, since every existing edge circuit on disk was attributed with it.)
+
+    Seeded (default 0) so a run is reproducible and so replicates come from varying the seed
+    alone -- the spread across seeds IS this estimator's error bar.
+    """
+    scores = torch.zeros((graph.n_forward, graph.n_backward), device='cuda', dtype=model.cfg.dtype)
+
+    # CPU generator, so the alpha stream depends only on the seed and the batch sizes -- not on
+    # the GPU, the dtype, or anything else that differs between the four models in this sweep.
+    gen = torch.Generator(device='cpu')
+    gen.manual_seed(seed)
+
+    total_items = 0
+    dataloader = dataloader if quiet else tqdm(dataloader)
+    for clean, corrupted, label in dataloader:
+        batch_size = len(clean)
+        total_items += batch_size
+        clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
+        corrupted_tokens, _, _, n_pos_corrupted = tokenize_plus(model, corrupted)
+
+        if n_pos != n_pos_corrupted:
+            print(f"Number of positions must match, but do not: {n_pos} (clean) != {n_pos_corrupted} (corrupted)")
+            raise ValueError("Number of positions must match")
+
+        (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference = make_hooks_and_matrices(model, graph, batch_size, n_pos, scores)
+
+        with torch.inference_mode():
+            with model.hooks(fwd_hooks=fwd_hooks_corrupted):
+                _ = model(corrupted_tokens, attention_mask=attention_mask)
+
+            input_activations_corrupted = activation_difference[:, :, graph.forward_index(graph.nodes['input'])].clone()
+
+            with model.hooks(fwd_hooks=fwd_hooks_clean):
+                clean_logits = model(clean_tokens, attention_mask=attention_mask)
+
+            input_activations_clean = input_activations_corrupted - activation_difference[:, :, graph.forward_index(graph.nodes['input'])]
+
+        def input_interpolation_hook(alpha: Tensor):
+            def hook_fn(activations, hook):
+                new_input = input_activations_corrupted + alpha * (input_activations_clean - input_activations_corrupted)
+                new_input.requires_grad = True
+                return new_input
+            return hook_fn
+
+        total_steps = 0
+        for step in range(steps):
+            total_steps += 1
+            alpha = torch.rand(batch_size, 1, 1, generator=gen).to(input_activations_corrupted)
+            with model.hooks(fwd_hooks=[(graph.nodes['input'].out_hook, input_interpolation_hook(alpha))], bwd_hooks=bwd_hooks):
+                logits = model(clean_tokens, attention_mask=attention_mask)
+                metric_value = metric(logits, clean_logits, input_lengths, label)
+                if torch.isnan(metric_value).any().item():
+                    raise ValueError("Metric value is NaN")
+                metric_value.backward()
+
+            if torch.isnan(scores).any().item():
+                raise ValueError(f"Scores are NaN at step {step}")
+
+    # Same normalisation as get_scores_eap_ig (total_steps is reset per batch, so it ends at
+    # `steps`), which keeps the mc scores on the same scale as the grid ones.
+    scores /= total_items
+    scores /= total_steps
+
+    return scores
+
+def get_scores_ig_activations(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
                               metric: Callable[[Tensor], Tensor], intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', 
                               steps=30, intervention_dataloader: Optional[DataLoader]=None, quiet=False):
 
@@ -416,9 +502,10 @@ def get_scores_information_flow_routes(model: HookedTransformer, graph: Graph, d
 
 allowed_aggregations = {'sum', 'mean'}    
 def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor], 
-              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'exact'], 
-              intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum', 
-              ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False):
+              method: Literal['EAP', 'EAP-IG-inputs', 'EAP-IG-inputs-mc', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'exact'],
+              intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
+              ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
+              mc_seed: int=0):
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
     assert model.cfg.use_split_qkv_input, "Model must be configured to use split qkv inputs (model.cfg.use_split_qkv_input)"
     assert model.cfg.use_hook_mlp_in, "Model must be configured to use hook MLP in (model.cfg.use_hook_mlp_in)"
@@ -437,6 +524,11 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
         if intervention != 'patching':
             raise ValueError(f"intervention must be 'patching' for EAP-IG-inputs, but got {intervention}")
         scores = get_scores_eap_ig(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet)
+    elif method == 'EAP-IG-inputs-mc':
+        if intervention != 'patching':
+            raise ValueError(f"intervention must be 'patching' for EAP-IG-inputs-mc, but got {intervention}")
+        scores = get_scores_eap_ig_mc(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet,
+                                      seed=mc_seed)
     elif method == 'clean-corrupted':
         if intervention != 'patching':
             raise ValueError(f"intervention must be 'patching' for clean-corrupted, but got {intervention}")
@@ -450,7 +542,7 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
         scores = get_scores_exact(model, graph, dataloader, metric, intervention=intervention, intervention_dataloader=intervention_dataloader, 
                                   quiet=quiet)
     else:
-        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'exact'], but got {method}")
+        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'EAP-IG-inputs-mc', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'exact'], but got {method}")
 
 
     if aggregation == 'mean':
