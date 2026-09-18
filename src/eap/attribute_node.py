@@ -67,6 +67,11 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
             hook (_type_): (unused)
 
         """
+        if gradients is None:
+            # No gradient reached this node: under GradDrop the nodes inside the dropped block
+            # are cut off from the loss and autograd hands their hooks an undefined (None) grad.
+            # That IS the zero term of the paper's sum, so contribute nothing.
+            return
         grads = gradients.detach()
         try:
             if per_example:
