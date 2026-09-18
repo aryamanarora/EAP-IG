@@ -14,7 +14,8 @@ from .utils import tokenize_plus, compute_mean_activations
 from .evaluate import evaluate_baseline, evaluate_graph
 
 
-def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:int , n_pos:int, scores: Optional[Tensor], neuron:bool=False):
+def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:int , n_pos:int, scores: Optional[Tensor], neuron:bool=False,
+                            per_example:bool=False):
     """Makes a matrix, and hooks to fill it and the score matrix up
 
     Args:
@@ -23,6 +24,9 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
         batch_size (int): size of the particular batch you're attributing
         n_pos (int): size of the position dimension
         scores (Tensor): The scores tensor you intend to fill. If you pass in None, we assume that you're using these hooks / matrices for evaluation only (so don't use the backwards hooks!)
+        per_example (bool): keep the batch axis in the score update -- `scores` is then
+            [batch, n_forward] ([batch, n_forward, d_model] with neuron=True) and holds one
+            estimate per example, for methods that take |.| per example before averaging (AtP).
 
     Returns:
         Tuple[Tuple[List, List, List], Tensor]: The final tensor ([batch, pos, n_src_nodes, d_model]) stores activation differences, 
@@ -65,11 +69,16 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
         """
         grads = gradients.detach()
         try:
-            if neuron:
+            if per_example:
+                pat = ('batch pos ... hidden, batch pos ... hidden -> batch ... hidden' if neuron
+                       else 'batch pos ... hidden, batch pos ... hidden -> batch ...')
+                scores[:, fwd_index] += einsum(activation_difference[:, :, fwd_index], grads, pat)
+            elif neuron:
                 s = einsum(activation_difference[:, :, fwd_index], grads,'batch pos ... hidden, batch pos ... hidden -> ... hidden')
+                scores[fwd_index] += s
             else:
                 s = einsum(activation_difference[:, :, fwd_index], grads,'batch pos ... hidden, batch pos ... hidden -> ...')
-            scores[fwd_index] += s
+                scores[fwd_index] += s
         except RuntimeError as e:
             print(hook.name, activation_difference.size(), activation_difference.device, grads.size(), grads.device)
             print(fwd_index, bwd_index, scores.size())
@@ -430,6 +439,127 @@ def get_scores_eap_ig_local(model: HookedTransformer, graph: Graph, dataloader: 
     # No /steps: the per-step increment already carries the 1/steps factor.
     scores /= total_items
     return scores
+
+
+class _DropBlockWrite(torch.autograd.Function):
+    """GradDrop's per-layer intervention on the backward pass (AtP*, Kramar et al. 2024, Sec. 3.2):
+    identity in value on resid_post, but the incoming gradient is routed ENTIRELY to the block's
+    resid_pre (the skip) and NONE of it to the block's write resid_post - resid_pre. That is
+    d L / d n under do(block_l out <- its clean value): downstream gradient reaches the layers
+    above l only through the residual skip, and every node inside block l gets no gradient at
+    all. Forward returns a clone rather than resid_pre + (post - pre).detach(), which would
+    perturb the bf16 forward by a rounding error that differs per dropped layer."""
+    @staticmethod
+    def forward(ctx, resid_post, resid_pre):
+        return resid_post.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return None, grad
+
+
+def grad_drop_hooks(layer: int):
+    """Forward hooks that drop layer `layer`'s residual write from the backward pass (see
+    _DropBlockWrite). hook_resid_pre's output is the tensor the block both reads and skips
+    forward, so passing it to the Function at hook_resid_post is exactly the skip path."""
+    holder = {}
+    def keep_pre(t, hook):
+        holder['pre'] = t
+        return t
+    def drop_write(t, hook):
+        return _DropBlockWrite.apply(t, holder['pre'])
+    return [(f'blocks.{layer}.hook_resid_pre', keep_pre), (f'blocks.{layer}.hook_resid_post', drop_write)]
+
+
+def get_scores_atp(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
+                   quiet: bool = False, neuron: bool = False, grad_drop: bool = False,
+                   intervention: Literal['patching', 'zero'] = 'patching'):
+    """Attribution Patching, AtP / AtP* (Kramar et al. 2024, arXiv:2403.00745), at MIB node granularity.
+
+    AtP (Eq. 4-5 there): for node n and prompt pair (clean, noise), the linear estimate
+        I_AtP(n; x) = (n(x_noise) - n(x_clean)) . dL(M(x_clean)) / dn
+    and c_AtP(n) = E_x |I_AtP(n; x)|, i.e. the ABSOLUTE VALUE IS TAKEN PER EXAMPLE, inside the
+    expectation, so that effects of opposite sign across the distribution do not cancel. The
+    signed E_x[I_AtP] is what `EAP` / `EAP-IG-inputs --ig-steps 1` (the I x G row) already
+    compute; the per-example |.| is the only thing separating `AtP` from them. A MIB node is
+    patched at every position at once, so the per-example estimate is the sum over positions of
+    the per-position dot products, and the |.| is taken of that sum -- the linearisation of
+    exactly the intervention MIB scores the ranking under.
+
+    AtP* = AtP + the two corrections of Sec. 3:
+      * QK fix (Sec. 3.1): recompute the attention softmax with the patched query/key instead of
+        linearising through it. It is defined for QUERY and KEY nodes, which are the nodes
+        whose first downstream nonlinearity is a saturated softmax. MIB's node set is head
+        OUTPUTS (hook_result), MLP outputs and the input embedding -- none of them is a q or k
+        node, and each writes linearly into the residual stream -- so on this node set the fix
+        has nothing to act on and AtP* reduces to AtP + GradDrop. Stated here so nobody goes
+        looking for the missing half.
+      * GradDrop (Sec. 3.2), grad_drop=True: for each layer l compute the AtP estimate with the
+        gradient through layer l's residual write dropped (dL^l/dn, _DropBlockWrite), then
+            c_AtP+GD(n) = E_x [ 1/(L-1) * sum_l |I_AtP+GD_l(n; x)| ]     (their Eq. 12).
+        The point is cancellation between a node's direct effect and its indirect effects
+        through later layers: with layer l dropped, whichever of those paths goes through l is
+        removed, so a node whose effects cancel in the plain gradient shows up in the terms
+        where the cancelling path is gone. A node's own layer l(n) contributes a zero term (no
+        gradient reaches the inside of a dropped block), so its direct effect is counted in
+        L-1 of the L terms, and 1/(L-1) is what makes a node with only a direct effect score
+        exactly its AtP value. The input node is in no block and is counted in all L terms, so
+        it is divided by L -- the same "number of terms the node survives" rule, extended to the
+        one node the paper's node set does not have.
+    Cost: 1 (AtP) or L (AtP*) forward+backward passes per batch over the clean prompt, on top of
+    the two forwards that cache the clean and noise activations. The paper reuses cached clean
+    activations for its L backwards; here each term is a fresh forward with the drop hooks
+    installed (the graph differs per l), which is 2x the paper's backward count and still O(L).
+
+    `metric` arrives from run_attribution.py as the batch MEAN, so each example's gradient carries
+    a 1/batch factor; it is multiplied back out before the |.| so the score is the per-example
+    quantity of the paper and the final /total_items is a plain mean over examples, as in every
+    other method here. Accumulation is fp32 (the sums of |.| run to 1000 examples x L terms).
+    """
+    n_layers = graph.cfg['n_layers']
+    shape = (graph.n_forward, graph.cfg['d_model']) if neuron else (graph.n_forward,)
+    scores = torch.zeros(shape, device='cuda', dtype=torch.float32)
+    input_idx = graph.forward_index(graph.nodes['input'])
+    # terms in which each node is NOT inside the dropped block: L-1 for layer nodes, L for input
+    n_terms = torch.full((graph.n_forward,), float(n_layers - 1) if grad_drop else 1.0, device='cuda')
+    if grad_drop:
+        n_terms[input_idx] = float(n_layers)
+
+    total_items = 0
+    dataloader = dataloader if quiet else tqdm(dataloader)
+    for clean, corrupted, label in dataloader:
+        batch_size = len(clean)
+        total_items += batch_size
+        clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
+        corrupted_tokens, _, _, _ = tokenize_plus(model, corrupted)
+
+        per_example = torch.zeros((batch_size,) + shape, device='cuda', dtype=torch.float32)
+        (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference = make_hooks_and_matrices(
+            model, graph, batch_size, n_pos, per_example, neuron=neuron, per_example=True)
+
+        with torch.inference_mode():
+            if intervention == 'patching':   # ZERO: no noise forward, so the delta is 0 - clean
+                with model.hooks(fwd_hooks=fwd_hooks_corrupted):
+                    _ = model(corrupted_tokens, attention_mask=attention_mask)   # += noise acts
+            # The clean hooks run ONCE here (-= clean acts -> noise - clean); the gradient passes
+            # below must not carry them, or each pass would subtract the clean activations again.
+            with model.hooks(fwd_hooks=fwd_hooks_clean):
+                clean_logits = model(clean_tokens, attention_mask=attention_mask)
+
+        batch_acc = torch.zeros_like(per_example)
+        for drop in (range(n_layers) if grad_drop else [None]):
+            per_example.zero_()
+            extra = [] if drop is None else grad_drop_hooks(drop)
+            with model.hooks(fwd_hooks=extra, bwd_hooks=bwd_hooks):
+                logits = model(clean_tokens, attention_mask=attention_mask)
+                metric_value = metric(logits, clean_logits, input_lengths, label)
+                (metric_value * batch_size).backward()      # undo the batch mean -> per-example grads
+            batch_acc += per_example.abs()
+        scores += batch_acc.sum(0)
+
+    scores /= total_items
+    scores /= n_terms.view(-1, *([1] * (scores.dim() - 1)))
+    return scores.to(model.cfg.dtype)
 
 
 class ShapleyElementwiseMult(torch.autograd.Function):
@@ -871,6 +1001,13 @@ def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoade
         # linearization -> linearize_act=False.
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, detach_qk=False,
                                  linearize_act=False, gim_attn=True)
+    elif method in ('AtP', 'AtP-star'):
+        # AtP = per-example |(noise - clean) . grad| (Kramar et al. 2024); AtP-star adds GradDrop.
+        # The QK fix half of AtP* is vacuous on MIB's node set -- see get_scores_atp's docstring.
+        if intervention not in ('patching', 'zero'):
+            raise ValueError(f"intervention must be 'patching' or 'zero' for {method}, but got {intervention}")
+        scores = get_scores_atp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron,
+                                grad_drop=(method == 'AtP-star'), intervention=intervention)
     elif method == 'RelP-norules':
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron, relp_hooks=False)
     elif method == 'EAP-IG-activations':
