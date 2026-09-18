@@ -190,7 +190,8 @@ def get_scores_eap(model: HookedTransformer, graph: Graph, dataloader:DataLoader
     return scores
 
 def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor], 
-                      steps=30, quiet:bool=False, neuron:bool=False):
+                      steps=30, quiet:bool=False, neuron:bool=False,
+                      intervention: Literal['patching', 'zero']='patching'):
     """Gets edge attribution scores using EAP with integrated gradients.
 
     Args:
@@ -224,8 +225,13 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
         (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference = make_hooks_and_matrices(model, graph, batch_size, n_pos, scores, neuron=neuron)
 
         with torch.inference_mode():
-            with model.hooks(fwd_hooks=fwd_hooks_corrupted):
-                _ = model(corrupted_tokens, attention_mask=attention_mask)
+            # ZERO ablation: skip the corrupted forward. activation_difference starts at 0, so
+            # the "corrupted" activations (and the input path's start) are 0 and the clean hooks
+            # below leave 0 - clean -- the endpoint delta of the zero intervention the circuit
+            # is then scored under (evaluate.py intervention='zero').
+            if intervention == 'patching':
+                with model.hooks(fwd_hooks=fwd_hooks_corrupted):
+                    _ = model(corrupted_tokens, attention_mask=attention_mask)
 
             input_activations_corrupted = activation_difference[:, :, graph.forward_index(graph.nodes['input'])].clone()
 
@@ -256,7 +262,8 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
 
 def get_scores_eap_ig_mc(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
-                         steps=1, quiet:bool=False, neuron:bool=False, seed:int=0):
+                         steps=1, quiet:bool=False, neuron:bool=False, seed:int=0,
+                         intervention: Literal['patching', 'zero']='patching'):
     """"Stepless" EAP-IG-inputs: alpha ~ U(0,1) drawn per example instead of a fixed grid.
 
     EAP-IG-inputs estimates  (a_clean - a_corrupted) . integral_0^1 grad(alpha) d alpha  with a
@@ -309,8 +316,13 @@ def get_scores_eap_ig_mc(model: HookedTransformer, graph: Graph, dataloader: Dat
         (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference = make_hooks_and_matrices(model, graph, batch_size, n_pos, scores, neuron=neuron)
 
         with torch.inference_mode():
-            with model.hooks(fwd_hooks=fwd_hooks_corrupted):
-                _ = model(corrupted_tokens, attention_mask=attention_mask)
+            # ZERO ablation: skip the corrupted forward. activation_difference starts at 0, so
+            # the "corrupted" activations (and the input path's start) are 0 and the clean hooks
+            # below leave 0 - clean -- the endpoint delta of the zero intervention the circuit
+            # is then scored under (evaluate.py intervention='zero').
+            if intervention == 'patching':
+                with model.hooks(fwd_hooks=fwd_hooks_corrupted):
+                    _ = model(corrupted_tokens, attention_mask=attention_mask)
 
             input_activations_corrupted = activation_difference[:, :, graph.forward_index(graph.nodes['input'])].clone()
 
@@ -627,7 +639,8 @@ def build_relp_fwd_hooks(model: HookedTransformer, use_norm=True, use_mlp=True, 
 def get_scores_relp(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
                     quiet: bool = False, neuron: bool = False, relp_hooks: bool = True, detach_qk: bool = True,
                     shapley_attn: bool = False, softmax_rule: bool = True, use_mlp: bool = True,
-                    linearize_act: bool = True, gim_attn: bool = False):
+                    linearize_act: bool = True, gim_attn: bool = False,
+                    intervention: Literal['patching', 'zero']='patching'):
     """RelP node attribution: (a^corrupted - a^clean) . grad, a single-point (input x grad)
     attribution where the backward pass uses RelP's relevance rules (see build_relp_fwd_hooks).
     With relp_hooks=False this is exactly input x grad (EAP / 1-step IG) -- used as a self-test."""
@@ -647,8 +660,9 @@ def get_scores_relp(model: HookedTransformer, graph: Graph, dataloader: DataLoad
         (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference = make_hooks_and_matrices(model, graph, batch_size, n_pos, scores, neuron=neuron)
 
         with torch.inference_mode():
-            with model.hooks(fwd_hooks=fwd_hooks_corrupted):
-                _ = model(corrupted_tokens, attention_mask=attention_mask)   # activation_difference = +corrupted
+            if intervention == 'patching':   # ZERO: no corrupted forward, so the delta is 0 - clean
+                with model.hooks(fwd_hooks=fwd_hooks_corrupted):
+                    _ = model(corrupted_tokens, attention_mask=attention_mask)   # activation_difference = +corrupted
             clean_logits = model(clean_tokens, attention_mask=attention_mask)
 
         extra = build_relp_fwd_hooks(model, use_mlp=use_mlp, use_qk=detach_qk, shapley_attn=shapley_attn,
@@ -820,14 +834,15 @@ def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoade
         scores = get_scores_eap(model, graph, dataloader, metric, intervention=intervention, 
                                 intervention_dataloader=intervention_dataloader, quiet=quiet, neuron=neuron)
     elif method == 'EAP-IG-inputs':
-        if intervention != 'patching':
-            raise ValueError(f"intervention must be 'patching' for EAP-IG-inputs, but got {intervention}")
-        scores = get_scores_eap_ig(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet, neuron=neuron)
+        if intervention not in ('patching', 'zero'):
+            raise ValueError(f"intervention must be 'patching' or 'zero' for EAP-IG-inputs, but got {intervention}")
+        scores = get_scores_eap_ig(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet, neuron=neuron,
+                                   intervention=intervention)
     elif method == 'EAP-IG-inputs-mc':
-        if intervention != 'patching':
-            raise ValueError(f"intervention must be 'patching' for EAP-IG-inputs-mc, but got {intervention}")
+        if intervention not in ('patching', 'zero'):
+            raise ValueError(f"intervention must be 'patching' or 'zero' for EAP-IG-inputs-mc, but got {intervention}")
         scores = get_scores_eap_ig_mc(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet,
-                                      neuron=neuron, seed=mc_seed)
+                                      neuron=neuron, seed=mc_seed, intervention=intervention)
     elif method == 'EAP-IG-inputs-local':
         if intervention != 'patching':
             raise ValueError(f"intervention must be 'patching' for EAP-IG-inputs-local, but got {intervention}")
@@ -842,8 +857,11 @@ def attribute_node(model: HookedTransformer, graph: Graph, dataloader: DataLoade
         # Faithful AttnLRP: RelP's norm/identity/half rules + the uniform rule on both attention
         # matmuls, and the ORDINARY softmax gradient (AttnLRP Eq. 13 reduces to it; LXT patches
         # nothing there). This is RelPShapley minus the invented ShapleySoftmax rule.
+        if intervention not in ('patching', 'zero'):
+            raise ValueError(f"intervention must be 'patching' or 'zero' for AttnLRP, but got {intervention}")
         scores = get_scores_relp(model, graph, dataloader, metric, quiet=quiet, neuron=neuron,
-                                 detach_qk=False, shapley_attn=True, softmax_rule=False)
+                                 detach_qk=False, shapley_attn=True, softmax_rule=False,
+                                 intervention=intervention)
     elif method == 'GIM':
         # GIM (Edin et al. 2026) = norm freeze + q/4,k/4,v/2 + tempered (T=2) softmax backward
         # + scale_mlp_gate. That last rule is `mlp_grad / 2` for GATED MLPs only, which is exactly
